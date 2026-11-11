@@ -5,6 +5,7 @@ from arq import cron
 from aiogram import Bot
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = 7989081494
 DB_PATH = os.environ.get("DB_PATH", "/data/archive.db")
 MEDIA_DIR = os.environ.get("MEDIA_DIR", "/data/media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -111,35 +112,96 @@ async def process_update(ctx, update_id: int):
             await db.commit()
 
         # удаления
-        evt = payload.get("deleted_business_messages")
-        if evt:
-            chat_id = evt.get("chat", {}).get("id")
-            ids = evt.get("message_ids", [])
-            if chat_id and ids:
-                for mid in ids:
-                    await db.execute(
-                        "INSERT OR IGNORE INTO deletions (connection_id, chat_id, message_id) VALUES (?, ?, ?)",
-                        (evt.get("business_connection_id"), chat_id, mid),
-                    )
-                    await db.execute(
-                        "UPDATE archive SET deleted_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND message_id = ?",
-                        (chat_id, mid),
-                    )
-                await db.commit()
+        # --- УДАЛЕНИЯ ---
+evt = payload.get("deleted_business_messages")
+if evt:
+    chat_id = evt.get("chat", {}).get("id")
+    ids = evt.get("message_ids", [])
+    if chat_id and ids:
+        for mid in ids:
+            await db.execute(
+                "INSERT OR IGNORE INTO deletions (connection_id, chat_id, message_id) VALUES (?, ?, ?)",
+                (evt.get("business_connection_id"), chat_id, mid),
+            )
+            await db.execute(
+                "UPDATE archive SET deleted_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND message_id = ?",
+                (chat_id, mid),
+            )
+
+            # достаём сохранённое и шлём владельцу
+            row = await db.execute_fetchone(
+                """SELECT sender_name, text, media_path, created_at
+                   FROM archive WHERE chat_id = ? AND message_id = ?""",
+                (chat_id, mid),
+            )
+            if row:
+                sender, text, media_path, created_at = row
+                when = created_at or "unknown time"
+                body = text or "[медиа/файл]"
+                note = f"🗑 УДАЛЕНО\nКто: {sender or 'unknown'}\nКогда: {when}\nЧто: {body}"
+                if media_path:
+                    note += f"\nФайл: {media_path}"
+                try:
+                    await bot.send_message(OWNER_ID, note)
+                except Exception as e:
+                    print(f"[!] owner notify failed: {e}")
+
+        await db.commit()
+
+# --- ПРАВКИ ---
+evt = payload.get("edited_business_message")
+if evt:
+    chat_id = evt.get("chat", {}).get("id")
+    msg_id = evt.get("message_id")
+    new_text = evt.get("text") or evt.get("caption")
+    edit_date = str(evt.get("edit_date"))
+    sender = evt.get("from", {})
+    sender_name = (sender.get("first_name", "") + " " + sender.get("last_name", "")).strip() or "unknown"
+
+    if chat_id and msg_id:
+        row = await db.execute_fetchone(
+            "SELECT text FROM archive WHERE chat_id = ? AND message_id = ?",
+            (chat_id, msg_id),
+        )
+        old_text = row[0] if row else None
+
+        await db.execute(
+            "INSERT INTO revisions (chat_id, message_id, old_text, new_text, edit_date) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, msg_id, old_text, new_text, edit_date),
+        )
+        await db.execute(
+            "UPDATE archive SET text = ? WHERE chat_id = ? AND message_id = ?",
+            (new_text, chat_id, msg_id),
+        )
+        await db.commit()
+
+        note = (
+            f"✏️ ИЗМЕНЕНО\nКто: {sender_name}\nКогда: {edit_date}\n"
+            f"Было: {old_text or '[не сохранено]'}\nСтало: {new_text or '[медиа]'}"
+        )
+        try:
+            await bot.send_message(OWNER_ID, note)
+        except Exception as e:
+            print(f"[!] owner notify failed: {e}")
 
         # правки
+                # правки
         evt = payload.get("edited_business_message")
         if evt:
             chat_id = evt.get("chat", {}).get("id")
             msg_id = evt.get("message_id")
             new_text = evt.get("text") or evt.get("caption")
             edit_date = str(evt.get("edit_date"))
+            sender = evt.get("from", {})
+            sender_name = (sender.get("first_name", "") + " " + sender.get("last_name", "")).strip() or "unknown"
+
             if chat_id and msg_id:
                 row = await db.execute_fetchone(
                     "SELECT text FROM archive WHERE chat_id = ? AND message_id = ?",
                     (chat_id, msg_id),
                 )
                 old_text = row[0] if row else None
+
                 await db.execute(
                     "INSERT INTO revisions (chat_id, message_id, old_text, new_text, edit_date) VALUES (?, ?, ?, ?, ?)",
                     (chat_id, msg_id, old_text, new_text, edit_date),
@@ -149,6 +211,15 @@ async def process_update(ctx, update_id: int):
                     (new_text, chat_id, msg_id),
                 )
                 await db.commit()
+
+                note = (
+                    f"✏️ ИЗМЕНЕНО\nКто: {sender_name}\nКогда: {edit_date}\n"
+                    f"Было: {old_text or '[не сохранено]'}\nСтало: {new_text or '[медиа]'}"
+                )
+                try:
+                    await bot.send_message(OWNER_ID, note)
+                except Exception as e:
+                    print(f"[!] owner notify failed: {e}")
 
 async def check_pending(ctx):
     import aiohttp
